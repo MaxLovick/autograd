@@ -1,180 +1,242 @@
 # autograd.c
- 
-An autograd engine written in pure C.
- 
-## Motivation
- 
-Sometimes I want to test a small neural network idea without using PyTorch, setting up a Python environment, and dealing with dependency conflicts. I built `autograd.c` so I could write self-contained programs in a single C file that compiles anywhere with a standard C compiler.
- 
-## What's included
- 
-**Tensor operations:** reshape, concatenation, broadcasting addition, scalar multiplication, element-wise multiplication, matrix multiplication, and N-dimensional convolution.
- 
-**Activation functions:** sigmoid, softmax, GELU, Swish, and Mish.
- 
-**Normalization:** Layer Norm and RMS Norm, both allow batch dimension information.
- 
-**Loss functions:** categorical cross-entropy (with label smoothing) and mean squared error, each supporting no batch reduction, sum, and mean reduction modes similar to Pytorch.
- 
-**Automatic differentiation:** a DAG-based tape that records the forward pass and computes gradients in the backwards pass. Every operation listed above has a corresponding backward implementation.
- 
-**Parameter initialization:** automatically selects an initialization strategy (He, Glorot, orthogonal via Householder QR) based on a BFS scan of connected nodes. Detects whether parameters feed into ReLU-like activations, softmax, recurrent connections, convolutions, or normalization layers and adjusts accordingly.
- 
-**Optimizers:** — SGD included, planning to add ADAM, ANO and MUON in the future.
- 
-**Utilities:** — a PCG32 random number generator, Gaussian sampling via Box-Muller, and a NumPy-style tensor printer with automatic summarization for large tensors.
- 
+
+`autograd.c` is an automatic differentiation graph similar to PyTorch written in C using only the standard library. It only uses the most common standard library functions so there is little concern about whether it will be supported on most compilers.
+
+There are no dependencies beyond `libc` and `libm`, no build system, and no headers to install so you can drop the one file into a project, write a `main`, and compile.
+
+## Features
+- **Reverse-mode automatic differentiation** over an explicit operation graph, so any composition of the built-in operators is differentiable with no extra code.
+- **A broad operator set**: matrix multiply, N-dimensional convolution, elementwise and scalar multiply, add, concatenate, resize, a family of activations (sigmoid, GELU, Swish, Mish, plus GELU-sine and GELU-sinc from *Mining Generalizable Activation Functions* and Mish-sine and Mish-sinc), normalization (softmax, LayerNorm, RMSNorm), and three losses (categorical cross-entropy, mean squared error, KL divergence).
+- **Optimizers**: SGD, Adam, Muon (with Newton–Schulz orthogonalization), and ANO.
+- **Regularization**: L1 and L2 weight penalties applied at the start of `optimize_weights`, plus three stochastic graph operators with full forward and backward passes: Dropout, DropPath (per-sample stochastic depth), and Zoneout.
+- **Initialization** picks He / Xavier / softmax-scaled variance based on downstream activation functions, applies orthogonal initialization to matmul weights, and offers an optional depth-based "emergence-promoting" rescaling. This should lead to more stable early training.
+
+## Design
+
+The library separates the structure of the graph from its execution using a tape-based execution model.
+
+A `Node` holds an operation type, its configuration if needed, edges to other nodes, and the indices of its tape entries. The collection of nodes is a directed acyclic graph that you build once. A `TapeEntry` array is the  execution of a node: it owns the `output_tensor` produced on the forward pass and the `gradient_tensor` accumulated on the backward pass.
+
+A `forward(dag)` call advances an internal time step, walks the tape executing every node whose inputs are ready, and records outputs. `backward(dag)` then walks the tape in reverse, calling the gradient function for each operation and accumulating the gradients. Because gradients accumulate with `+=`, weight sharing (the same parameter node feeding several operations, or the same cell unrolled across timesteps) is handled correctly with no special bookkeeping.
+
+`Tensor` holds a flat `float*` buffer, a `dims[TENSOR_DIMS]` shape, and an element count. `TENSOR_DIMS` is `5` by default, but every operation is written against that constant, so you can change it in one place if your project needs a different rank. Tensors are stored row-major.
+
+## Demo
+
+```sh
+gcc -std=c11 -O2 autograd.c -lm -o your_program
+```
+
+Any C11 compiler works; `-lm` links the math functions. The file compiles cleanly under `-Wall -Wextra`.
+
 ## Quick start
- 
-A small two-layer network that learns XOR:
- 
+
+A two-layer MLP — two linear layers with broadcast biases, a GELU nonlinearity, and dropout in between — trained against an MSE target. It also shows two optimizers in one graph (Muon on the weight matrices, Adam on the biases), L2 on the weights, and both initializers.
+
 ```c
-#include "tensors.c"
- 
-int main() {
-    PCGRandomNumberGenerator rng = { .state = 42, .inc = 54 };
-    DirectedAcyclicGraph dag = create_DirectedAcyclicGraph();
- 
-    // --- Define graph nodes ---
- 
-    // Input: batch of 4 samples, 2 features each
-    size_t input_node = add_node(&dag, OP_TYPE_INPUT, NULL);
- 
-    // Hidden layer: W1 [2, 8], b1 [1, 8]
-    size_t W1_dims[] = {1, 1, 1, 2, 8};
-    ParameterConfig W1_cfg = { .dims = W1_dims, .allow_parameter_updates = true,
-        .optimization_algorithm = OPTIMIZER_STOCHASTIC_GRADIENT_DESCENT,
-        .optimizer_config = &(StochasticGradientDescentConfig){ .learning_rate = 0.1f } };
-    size_t W1_node = add_node(&dag, OP_TYPE_PARAMETERS, &W1_cfg);
- 
-    size_t b1_dims[] = {1, 1, 1, 1, 8};
-    ParameterConfig b1_cfg = { .dims = b1_dims, .allow_parameter_updates = true,
-        .optimization_algorithm = OPTIMIZER_STOCHASTIC_GRADIENT_DESCENT,
-        .optimizer_config = &(StochasticGradientDescentConfig){ .learning_rate = 0.1f } };
-    size_t b1_node = add_node(&dag, OP_TYPE_PARAMETERS, &b1_cfg);
- 
-    size_t matmul1_node = add_node(&dag, OP_TYPE_MATMUL, NULL);
-    size_t add1_node = add_node(&dag, OP_TYPE_ADD, NULL);
-    size_t act1_node = add_node(&dag, OP_TYPE_GELU, NULL);
- 
-    // Output layer: W2 [8, 1], b2 [1, 1]
-    size_t W2_dims[] = {1, 1, 1, 8, 1};
-    ParameterConfig W2_cfg = { .dims = W2_dims, .allow_parameter_updates = true,
-        .optimization_algorithm = OPTIMIZER_STOCHASTIC_GRADIENT_DESCENT,
-        .optimizer_config = &(StochasticGradientDescentConfig){ .learning_rate = 0.1f } };
-    size_t W2_node = add_node(&dag, OP_TYPE_PARAMETERS, &W2_cfg);
- 
-    size_t b2_dims[] = {1, 1, 1, 1, 1};
-    ParameterConfig b2_cfg = { .dims = b2_dims, .allow_parameter_updates = true,
-        .optimization_algorithm = OPTIMIZER_STOCHASTIC_GRADIENT_DESCENT,
-        .optimizer_config = &(StochasticGradientDescentConfig){ .learning_rate = 0.1f } };
-    size_t b2_node = add_node(&dag, OP_TYPE_PARAMETERS, &b2_cfg);
- 
-    size_t matmul2_node = add_node(&dag, OP_TYPE_MATMUL, NULL);
-    size_t add2_node = add_node(&dag, OP_TYPE_ADD, NULL);
- 
-    // Loss
-    size_t target_node = add_node(&dag, OP_TYPE_TARGET, NULL);
-    MeanSquareErrorConfig mse_cfg = { .batch_dim = 3, .reduction_type = REDUCTION_TYPE_MEAN };
-    size_t loss_node = add_node(&dag, OP_TYPE_MEAN_SQUARE_ERROR, &mse_cfg);
- 
-    // --- Wire edges ---
-    add_edge(&dag, input_node, matmul1_node);    // input × W1
-    add_edge(&dag, W1_node, matmul1_node);
-    add_edge(&dag, matmul1_node, add1_node);     // + b1
-    add_edge(&dag, b1_node, add1_node);
-    add_edge(&dag, add1_node, act1_node);        // GELU
- 
-    add_edge(&dag, act1_node, matmul2_node);     // hidden × W2
-    add_edge(&dag, W2_node, matmul2_node);
-    add_edge(&dag, matmul2_node, add2_node);     // + b2
-    add_edge(&dag, b2_node, add2_node);
- 
-    add_edge(&dag, add2_node, loss_node);        // MSE(prediction, target)
-    add_edge(&dag, target_node, loss_node);
- 
-    initialize_parameters(&dag, &rng);
- 
-    // --- XOR data ---
-    size_t input_dims[] = {1, 1, 1, 4, 2};
-    Tensor input_tensor = create_tensor(input_dims);
-    float xor_inputs[] = {0,0, 0,1, 1,0, 1,1};
-    memcpy(input_tensor.data, xor_inputs, sizeof(xor_inputs));
- 
-    size_t target_dims[] = {1, 1, 1, 4, 1};
-    Tensor target_tensor = create_tensor(target_dims);
-    float xor_targets[] = {0, 1, 1, 0};
-    memcpy(target_tensor.data, xor_targets, sizeof(xor_targets));
- 
-    // --- Train ---
-    for(int step = 0; step < 1000; step++) {
-        add_input(&dag, input_node, input_tensor);
-        add_input(&dag, target_node, target_tensor);
+#include /* the contents of autograd.c, or compile it as your translation unit */
+
+#define IN      16
+#define HIDDEN  32
+#define OUT     4
+#define BATCH   8
+
+/* Muon + L2, for the weight matrices */
+static OperationConfiguration muon_weight(void) {
+    OperationConfiguration c;
+    c.parameters.allow_parameter_updates = true;
+    c.parameters.l1_strength = 0.0f;
+    c.parameters.l2_strength = 1e-4f;
+    c.parameters.optimizer.type = OPTIMIZER_TYPE_MUON;
+    c.parameters.optimizer.config.muon.learning_rate = 2e-2f;
+    c.parameters.optimizer.config.muon.momentum = 0.95f;
+    c.parameters.optimizer.config.muon.newton_schulz_steps = 5;
+    c.parameters.optimizer.config.muon.nesterov = true;
+    c.parameters.optimizer.config.muon.momentum_buffer.data = NULL;  /* lazily allocated */
+    return c;
+}
+
+/* Adam, no decay, for the biases */
+static OperationConfiguration adam_bias(void) {
+    OperationConfiguration c;
+    c.parameters.allow_parameter_updates = true;
+    c.parameters.l1_strength = 0.0f;
+    c.parameters.l2_strength = 0.0f;
+    c.parameters.optimizer.type = OPTIMIZER_TYPE_ADAM;
+    c.parameters.optimizer.config.adam.learning_rate = 1e-3f;
+    c.parameters.optimizer.config.adam.beta1 = 0.9f;
+    c.parameters.optimizer.config.adam.beta2 = 0.999f;
+    c.parameters.optimizer.config.adam.epsilon = 1e-8f;
+    c.parameters.optimizer.config.adam.time_step = 0;
+    c.parameters.optimizer.config.adam.first_moment.data = NULL;
+    c.parameters.optimizer.config.adam.second_moment.data = NULL;
+    return c;
+}
+
+int main(void) {
+    DirectedAcyclicGraph dag = create_directed_acyclic_graph();
+
+    /* --- structure: x -> (W1,b1) -> GELU -> Dropout -> (W2,b2) -> MSE --- */
+    size_t x = add_node(&dag, OPERATION_TYPE_INPUT, NULL);
+
+    OperationConfiguration w1c = muon_weight();
+    OperationConfiguration b1c = adam_bias();
+    OperationConfiguration w2c = muon_weight();
+    OperationConfiguration b2c = adam_bias();
+    size_t W1 = add_node(&dag, OPERATION_TYPE_PARAMETERS, &w1c);
+    size_t b1 = add_node(&dag, OPERATION_TYPE_PARAMETERS, &b1c);
+    size_t W2 = add_node(&dag, OPERATION_TYPE_PARAMETERS, &w2c);
+    size_t b2 = add_node(&dag, OPERATION_TYPE_PARAMETERS, &b2c);
+
+    size_t mm1 = add_node(&dag, OPERATION_TYPE_MATRIX_MULTIPLICATION, NULL);
+    add_edge(&dag, x, mm1);     /* {1,1,1,BATCH,IN} */
+    add_edge(&dag, W1, mm1);    /* {1,1,1,IN,HIDDEN} */
+
+    size_t add1 = add_node(&dag, OPERATION_TYPE_ADD, NULL);
+    add_edge(&dag, mm1, add1);
+    add_edge(&dag, b1, add1);   /* {1,1,1,1,HIDDEN}, broadcasts over the batch */
+
+    size_t act = add_node(&dag, OPERATION_TYPE_GELU, NULL);
+    add_edge(&dag, add1, act);
+
+    OperationConfiguration drop_config;
+    drop_config.stochastic_regularization.probability = 0.1f;
+    drop_config.stochastic_regularization.sample_dimension = 0;  /* unused by dropout */
+    drop_config.stochastic_regularization.base_seed = 0x1234ABCDULL;
+    size_t drop = add_node(&dag, OPERATION_TYPE_DROPOUT, &drop_config);
+    add_edge(&dag, act, drop);
+
+    size_t mm2 = add_node(&dag, OPERATION_TYPE_MATRIX_MULTIPLICATION, NULL);
+    add_edge(&dag, drop, mm2);
+    add_edge(&dag, W2, mm2);    /* {1,1,1,HIDDEN,OUT} */
+
+    size_t add2 = add_node(&dag, OPERATION_TYPE_ADD, NULL);
+    add_edge(&dag, mm2, add2);
+    add_edge(&dag, b2, add2);   /* {1,1,1,1,OUT} */
+
+    size_t target = add_node(&dag, OPERATION_TYPE_INPUT, NULL);
+    size_t loss = add_node(&dag, OPERATION_TYPE_MEAN_SQUARE_ERROR, NULL);
+    add_edge(&dag, add2, loss);
+    add_edge(&dag, target, loss);
+
+    /* --- parameter storage + shapes (last two dims are the matrix) --- */
+    size_t w1_dims[TENSOR_DIMS] = {1, 1, 1, IN, HIDDEN};
+    size_t b1_dims[TENSOR_DIMS] = {1, 1, 1, 1,  HIDDEN};
+    size_t w2_dims[TENSOR_DIMS] = {1, 1, 1, HIDDEN, OUT};
+    size_t b2_dims[TENSOR_DIMS] = {1, 1, 1, 1,  OUT};
+    add_input_to_dag(&dag, W1, create_tensor(w1_dims));
+    add_input_to_dag(&dag, b1, create_tensor(b1_dims));
+    add_input_to_dag(&dag, W2, create_tensor(w2_dims));
+    add_input_to_dag(&dag, b2, create_tensor(b2_dims));
+
+    initialize_parameters(&dag);                     /* variance from topology + orthogonal matmul weights */
+    emergence_promoting_initialization(&dag, 1.1f);  /* optional rescaling */
+
+    /* --- training loop --- */
+    for (int step = 0; step < 1000; step++) {
+        add_input_to_dag(&dag, x, x_batch);          /* {1,1,1,BATCH,IN}  */
+        add_input_to_dag(&dag, target, y_batch);     /* {1,1,1,BATCH,OUT} */
+
         forward(&dag);
- 
-        if(step % 100 == 0) {
-            size_t loss_tape_idx = dag.nodes[loss_node].tape_entry_indices[dag.nodes[loss_node].total_tape_entries - 1];
-            printf("step %4d  loss: %.6f\n", step, dag.tape_entries[loss_tape_idx].output_tensor.data[0]);
-        }
- 
         backward(&dag);
-        update_parameters(&dag);
-        reset_memory(&dag, false);
+        optimize_weights(&dag);
+        clear_memory(&dag);   /* frees the step's tape, keeps the parameters */
     }
- 
-    // --- Final predictions ---
-    add_input(&dag, input_node, input_tensor);
-    add_input(&dag, target_node, target_tensor);
-    forward(&dag);
- 
-    size_t output_tape_idx = dag.nodes[add2_node].tape_entry_indices[dag.nodes[add2_node].total_tape_entries - 1];
-    printf("\nResults:\n");
-    printf("  [0, 0] -> %.4f  (target: 0)\n", dag.tape_entries[output_tape_idx].output_tensor.data[0]);
-    printf("  [0, 1] -> %.4f  (target: 1)\n", dag.tape_entries[output_tape_idx].output_tensor.data[1]);
-    printf("  [1, 0] -> %.4f  (target: 1)\n", dag.tape_entries[output_tape_idx].output_tensor.data[2]);
-    printf("  [1, 1] -> %.4f  (target: 0)\n", dag.tape_entries[output_tape_idx].output_tensor.data[3]);
- 
+
     return 0;
 }
 ```
- 
-## Design choices
-- **Tape-based autograd (similar to pytorch):** every forward operation appends to a linear tape. Backward walks the tape in reverse. Recurrent connections are supported by tracking time steps.
-- **Zero external dependencies:** only the C standard library.
-- **No error checking:** assume that the user has planned out the network and won't need dimension checking.  Also the networks will be small enough and won't be important enough to need memory allocation checks.  This eliminated a lot of code I didn't want to write.
 
-## Limitations
- 
-- **No GPU support**
-- **Small operation set** 
-- **No data loading, preprocessing, or serialization**
-- **No automatic mixed precision or quantization**
- 
-## Future improvements
- 
-**Performance**
-- Reduce `realloc` frequency by adding size and capacity variables
-- Improve matmul and convolution cache locality (tiling / blocking for better L1/L2 utilization)
+The pattern is: build the graph once, attach and initialize parameters once, then each step re-feed the inputs, run `forward` / `backward` / `optimize_weights`, and `clear_memory` to release that step's tape while the parameter tensors persist. Swapping in other operators is the same recipe — add the node, wire its edges in argument order, and the forward/backward passes pick it up automatically.
 
-**Initializers**
-- Emergence Promoting Initialization (Advancing Neural Network Performance through Emergence-Promoting Initialization Scheme)
+## Core API
 
-**Hyperparameter tuning**
-- Write a PROTEIN like function similar to Pufferlib for hyperparameter sweeps
+**Graph construction**
 
-**Operations & losses**
-- Chemical reaction operations (GenAI-Net: A Generative AI Framework for Automated Biomolecular Network Design)
-- Additional non linear functions (Mining Generalizable Activation Functions)
-- KL divergence loss
- 
-**Optimizers**
-- Adam
-- Muon
-- ANO
+- `DirectedAcyclicGraph create_directed_acyclic_graph(void)` — returns an empty graph.
+- `size_t add_node(dag, op_type, config)` — adds a node and returns its index; pass `NULL` for `config` on ops that take none.
+- `void add_edge(dag, src_node, dst_node)` — connects an output to an input. **Edge order is the argument order**: for matmul the first edge is the left operand, for zoneout the first edge is the current state and the second is the previous state.
+- `void add_input_to_dag(dag, node_index, tensor)` — attaches a tensor to an `INPUT` or `PARAMETERS` node (it stores a copy). Call once per parameter to give it shape and storage; call each step to feed inputs and targets.
 
-**Storage & usability**
-- Add functions to read and write to files so that I can use trained models in both pytorch and autograd.c
- 
-## Research directions
- 
-The area I'm most interested in exploring is using evolutionary optimizers to study how models make runtime improvements in RL environments (e.g. a game-playing agent improves its strategy based on opponent strategy). Then see if interpretability methods can identify what changes inside the network when this capability emerges,and whether that understanding can be transferred to different domains such as language processing.
+**Initialization**
+
+- `void initialize_parameters(dag)` — initializes each parameter from the graph structure (see below).
+- `void emergence_promoting_initialization(dag, alpha)` — optional depth rescaling of weight layers, based on the paper *Advancing Neural Network Performance through Emergence-Promoting Initialization Scheme*.
+
+**Execution**
+
+- `void forward(dag)` — runs the forward pass for the next time step.
+- `void backward(dag)` — accumulates gradients in reverse.
+- `void optimize_weights(dag)` — applies L1/L2 then the optimizer.  Set to 0 in the config to skip.
+- `void clear_memory(dag)` — frees the tape and re-seeds parameter tape entries for the next step.
+
+**Tensors**
+
+- `create_tensor(dims)`, `copy_tensor(t)`, `free_tensor(&t)`
+- `set_tensor_data_to_zero(&t)`, `set_tensor_data_to_ones(&t)`, `add_gaussian_noise_to_tensor(&t, mean, std)`
+- `get_data_index(t, indices)` — flat offset for a multi-index.
+
+## Operations
+
+| Category | Operation types |
+| --- | --- |
+| Structural | `RESIZE`, `CONCATENATE`, `ADD`, `SCALAR_MULTIPLICATION`, `ELEMENTWISE_MULTIPLICATION`, `MATRIX_MULTIPLICATION`, `CONVOLUTION` |
+| Activations | `SIGMOID`, `GELU`, `SWISH`, `MISH`, `GELU_SINE`, `GELU_SINC`, `MISH_SINE`, `MISH_SINC` |
+| Normalization | `SOFTMAX`, `LAYER_NORM`, `RMS_LAYER_NORM` |
+| Losses | `CATEGORICAL_CROSS_ENTROPY_LOSS`, `MEAN_SQUARE_ERROR`, `KL_DIVERGENCE` |
+| Stochastic regularizers | `DROPOUT`, `DROPPATH`, `ZONEOUT` |
+| Special | `INPUT`, `PARAMETERS` |
+
+`ADD`, `ELEMENTWISE_MULTIPLICATION`, and `MATRIX_MULTIPLICATION` broadcast dimensions of size `1`. For matmul the last two dimensions are the matrix; leading dimensions are batched. Convolution is channel-first: dimension `0` is channels and the remaining dimensions are spatial; a kernel packs its `(out_channels * in_channels)` filters along dimension `0`.
+
+## Optimizers
+
+Set `parameters.optimizer.type` on each `PARAMETERS` node:
+
+- **`OPTIMIZER_TYPE_STOCHASTIC_GRADIENT_DESCENT`** — plain SGD with a learning rate.
+- **`OPTIMIZER_TYPE_ADAM`** — Adam with bias correction.
+- **`OPTIMIZER_TYPE_MUON`** — momentum with Newton–Schulz orthogonalization of the update. Supports Nesterov momentum and a configurable number of iteration steps.
+- **`OPTIMIZER_TYPE_ANO`** — sign-based adaptive update with decoupled weight decay.
+
+Each parameter owns its optimizer state, so different layers can use different optimizers in the same graph.
+
+## Regularization
+
+**Weight penalties** are applied inside `optimize_weights` before the optimizer step, driven by two independent floats on each `PARAMETERS` node:
+
+- `l2_strength` adds `l2_strength * w` to the gradient (ridge).
+- `l1_strength` adds `l1_strength * sign(w)` to the gradient (lasso).
+
+Both can be nonzero simultaneously and a strength of `0` skips that penalty entirely.
+
+**Stochastic regularizers** are configured with a `StochasticRegularizationConfiguration` (`probability`, `sample_dimension`, `base_seed`):
+
+- **Dropout** — per element inverted dropout: a fraction `probability` of activations are zeroed and the survivors are scaled by `1 / (1 - probability)`.
+- **DropPath** — per-sample stochastic depth: whole samples along `sample_dimension` are dropped or kept as a unit, scaled the same way. Use this on a residual branch and add the identity path with `ADD`.
+- **Zoneout** — for RNNs: with probability `probability` a unit keeps its previous state instead of the newly computed one, passing that state and its gradient straight through the timestep. It takes two inputs — add the current-state edge first and the previous-state edge second.
+
+These three derive their per-call random seed from `base_seed` combined with the operation's time step and node index, so the mask changes every step and differs across layers while remaining identical between a forward pass and its backward pass.
+
+There is no separate inference mode. To evaluate without stochasticity, set `probability = 0` (Dropout and DropPath become the identity; Zoneout always takes the current state) or build an evaluation graph without these nodes.
+
+## Initialization
+
+`initialize_parameters` inspects what each parameter feeds into, up to three operations downstream, and chooses a strategy based on these rules:
+
+- Parameters used only in `ADD` (biases) are left at zero.
+- A relu-like activation (GELU/Swish/Mish) downstream selects He-style variance `2 / fan_in`.
+- A softmax or cross-entropy downstream selects `1 / fan_in`.
+- Otherwise it uses Xavier/Glorot variance `2 / (fan_in + fan_out)`.
+- Convolution weights compute fan-in/fan-out from channel and kernel extents.
+- Matmul weights with at least as many rows as columns are additionally made column-orthonormal via Householder QR.
+
+`emergence_promoting_initialization(dag, alpha)` is an optional pass that ranks weight layers by depth and scales them geometrically around the middle layer by powers of `alpha`.
+
+## Notes and limitations
+
+- `TENSOR_DIMS` defaults to `5`. Prefer `RESIZE` over lowering it. Only change the constant directly if you are sure nothing in the project needs five dimensions.
+- `MEAN_SQUARE_ERROR` reduces over the entire tensor, but `CATEGORICAL_CROSS_ENTROPY_LOSS` and `KL_DIVERGENCE` score a single distribution along the last dimension. Batch them by accumulating gradients over several forward/backward passes before calling `optimize_weights` and `clear_memory`.
+- Normalization `gamma`/`beta` are ordinary parameters, and the structure-aware initializer fills them like weights rather than at one/zero, so set them yourself after `initialize_parameters` if you want the conventional unit-scale start.
+- Computation is `float`, but reductions in normalization and softmax accumulate in `double` internally for stability.
+- The engine is single-threaded and CPU-only, written for clarity and portability rather than peak throughput.
+- There is no inference/training mode yet.
