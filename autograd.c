@@ -69,7 +69,7 @@ typedef enum {
 } OperationType;
 
 typedef enum {
-    OPERATION_TYPE_NONE,
+    OPTIMIZER_TYPE_NONE,
     OPTIMIZER_TYPE_STOCHASTIC_GRADIENT_DESCENT,
     OPTIMIZER_TYPE_ADAM,
     OPTIMIZER_TYPE_MUON,
@@ -166,25 +166,21 @@ typedef union {
 typedef struct {
     OperationType op_type;
     OperationConfiguration op_config;
-
     size_t total_src_nodes;
     size_t total_dst_nodes;
     size_t* src_node_indices;
     size_t* dst_node_indices;
-
     size_t total_tape_entries;
     size_t* tape_entry_indices;
 } Node;
 
 typedef struct {
     uint64_t time_step;
-
     size_t node_index;
     size_t total_src_tape_entries;
     size_t total_dst_tape_entries;
     size_t* src_tape_entry_indices;
     size_t* dst_tape_entry_indices;
-
     Tensor output_tensor;
     Tensor gradient_tensor;
 } TapeEntry;
@@ -193,7 +189,6 @@ typedef struct {
     uint64_t current_time_step;
     size_t total_nodes;
     size_t total_tape_entries;
-    size_t tape_entries_capacity;
     Node* nodes;
     TapeEntry* tape_entries;
 } DirectedAcyclicGraph;
@@ -1626,7 +1621,6 @@ DirectedAcyclicGraph create_directed_acyclic_graph() {
     dag.current_time_step = 0;
     dag.total_nodes = 0;
     dag.total_tape_entries = 0;
-    dag.tape_entries_capacity = 0;
     dag.nodes = NULL;
     dag.tape_entries = NULL;
     return dag;
